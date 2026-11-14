@@ -36,21 +36,41 @@ class SurfaceQP:
     n_calendar_inequalities: int
     pair_diagnostics: list[CalendarPairDiagnostics]
     varswap_terms: list[VarianceSwapTerms] | None = None
+    calendar_slacks: list = field(default_factory=list)
 
 
-def _one_sided_band_constraint(
-    dominant_design_or_h: np.ndarray,
-    dominant_var: cp.Variable,
-    subordinate_h: np.ndarray,
-    subordinate_var: cp.Variable,
+def _band_calendar_constraint(
+    n1_term: np.ndarray,
+    n1_var: cp.Variable,
+    n_term: np.ndarray,
+    n_var: cp.Variable,
     eps: np.ndarray,
+    margin_on: str,
+    slack: cp.Variable | None = None,
 ) -> cp.Constraint:
-    """dominant - subordinate - eps@subordinate_weights >= 0, row-wise (paper,
-    Section 6, eq. 19-20: the wing side is only known up to the Hermite
-    interpolation error margin eps, so it is conservatively discounted by
-    eps @ weights before comparing to the exactly-represented body side)."""
-    margin = eps @ subordinate_var if eps.size else 0.0
-    return dominant_design_or_h @ dominant_var - subordinate_h.T @ subordinate_var - margin >= 0
+    """c_{n+1} - c_n - margin >= 0, row-wise, on a band where one of the two
+    maturities is represented by its exact body spline and the other by its
+    wing dictionary (paper, Section 6, eq. 19-20). Whichever side is the wing
+    is only known up to the Hermite interpolation error bound eps per atom,
+    so its contribution is conservatively discounted by eps @ wing_weights
+    before comparing the two sides (``margin_on`` names which operand, "n" or
+    "n1", carries the wing and hence the margin)."""
+    # The wing side's design array is stored as (n_atoms, n_grid) (one row per
+    # atom); the body side's design matrix is already (n_grid, n_coef). Only
+    # the operand named by ``margin_on`` is the wing, so only that one needs
+    # transposing before the grid-row matrix product.
+    if margin_on == "n1":
+        margin = eps @ n1_var if eps.size else 0.0
+        n1_term = n1_term.T
+    elif margin_on == "n":
+        margin = eps @ n_var if eps.size else 0.0
+        n_term = n_term.T
+    else:
+        raise ValueError(f"margin_on must be 'n' or 'n1', got {margin_on!r}")
+    lhs = n1_term @ n1_var - n_term @ n_var - margin
+    if slack is not None:
+        lhs = lhs + slack
+    return lhs >= 0
 
 
 def _wing_wing_rows(
@@ -60,6 +80,7 @@ def _wing_wing_rows(
     a_n1: cp.Variable,
     kappa_n1: float,
     delta_mu: float,
+    slack: cp.Variable | None = None,
 ) -> cp.Constraint:
     """Summation-by-parts deep wing-wing calendar condition (paper, Appendix A).
 
@@ -67,15 +88,31 @@ def _wing_wing_rows(
     already ordered by decreasing mu (src/wing_dictionary.py), S_m = sum_{i>=m}
     (beta_i^(n+1) - (1+delta_mu)*beta_i^(n)) >= 0 for m=1..N_a is a sufficient
     condition for c_{n+1}(k) - c_n(k) >= 0 for every k beyond both seams,
-    normalised by psi_m(kappa_bar) so every pair's rows have comparable scale.
+    normalised by psi_m(kappa_bar) = kappa_bar^(-1/2)*exp(-mu_m*kappa_bar) so
+    every pair's rows have comparable scale.
+
+    Each row's coefficient on a_i is folded directly into
+    exp(mu_i*kappa_x - mu_m*kappa_bar) instead of forming the raw beta_i and
+    psi_m factors separately and multiplying them afterward: atoms are
+    ordered by decreasing mu, the summation only touches i >= m (so
+    mu_i <= mu_m), and kappa_bar = max(kappa_n, kappa_n1), so every exponent
+    here is <= 0 and the row stays well-conditioned. Forming exp(mu_i*kappa_x)
+    on its own first overflows for the deepest atoms (mu up to ~100) on the
+    widest seams (kappa up to ~3 for the longest maturity), even though the
+    product with psi_m is mathematically O(1).
     """
-    beta_n = cc.wing_summation_by_parts_beta(a_n, mu, kappa_n)
-    beta_n1 = cc.wing_summation_by_parts_beta(a_n1, mu, kappa_n1)
-    U = cc.wing_calendar_cumulative_rows(mu)
+    n = len(mu)
     kappa_bar = max(kappa_n, kappa_n1)
-    psi = cc.wing_calendar_normalisation(mu, kappa_bar)
-    S = U @ (beta_n1 - (1.0 + delta_mu) * beta_n)
-    return cp.multiply(S, 1.0 / psi) >= 0
+    i_ge_m = (np.arange(n)[None, :] >= np.arange(n)[:, None]).astype(float)
+    mu_col, mu_row = mu[None, :], mu[:, None]
+
+    def _weights(kappa: float) -> np.ndarray:
+        return i_ge_m * np.sqrt(kappa / kappa_bar) * np.exp(mu_col * kappa - mu_row * kappa_bar)
+
+    lhs = _weights(kappa_n1) @ a_n1 - (1.0 + delta_mu) * (_weights(kappa_n) @ a_n)
+    if slack is not None:
+        lhs = lhs + slack
+    return lhs >= 0
 
 
 def build_surface_qp(
@@ -92,9 +129,19 @@ def build_surface_qp(
     body_wing_error_fraction: float,
     wing_margin_delta_mu: float,
     with_variance_swap: bool = False,
+    body_body_calendar_mode: str = "merged_knot",
+    slack_penalty: float = 0.0,
 ) -> SurfaceQP:
     """Assemble the joint QP: per-slice body/wing blocks plus calendar
-    inequalities for every adjacent pair of maturities (paper, Section 6)."""
+    inequalities for every adjacent pair of maturities (paper, Section 6).
+
+    ``slack_penalty`` > 0 adds a non-negative, quadratically penalised slack
+    to every calendar inequality (see src/config.py, CALENDAR_SLACK_PENALTY):
+    the paper's own curated snapshot needs none, but a live chain can carry a
+    handful of microscopic raw calendar crossings from asynchronous bid/ask
+    quotes on near-worthless deep-OTM contracts, which would otherwise make
+    the single joint QP infeasible.
+    """
     order = np.argsort([f.t_expiry for f in fits])
     fits_sorted = [fits[i] for i in order]
 
@@ -105,6 +152,15 @@ def build_surface_qp(
     constraints: list = []
     objective_terms = []
     varswap_terms: list[VarianceSwapTerms] = []
+    calendar_slacks: list = []
+
+    def _slack(n_rows: int) -> cp.Variable | None:
+        if slack_penalty <= 0:
+            return None
+        s = cp.Variable(n_rows, nonneg=True)
+        calendar_slacks.append(s)
+        objective_terms.append(slack_penalty * cp.sum_squares(s))
+        return s
     for v in slice_vars:
         constraints += calibration.body_constraints(v, convexity_eps)
         constraints += calibration.wing_join_constraints(v)
@@ -122,8 +178,25 @@ def build_surface_qp(
 
         overlap = cc.body_body_overlap(v_n.basis, v_n1.basis, subdivisions)
         if overlap is not None:
-            constraints.append(overlap.M_n1 @ v_n1.d - overlap.M_n @ v_n.d >= 0)
-            n_calendar += overlap.M_n.shape[0]
+            if body_body_calendar_mode == "merged_knot":
+                s = _slack(overlap.M_n.shape[0])
+                lhs = overlap.M_n1 @ v_n1.d - overlap.M_n @ v_n.d
+                constraints.append((lhs + s if s is not None else lhs) >= 0)
+                n_calendar += overlap.M_n.shape[0]
+            elif body_body_calendar_mode == "grid":
+                # Same inequality count as the merged-knot condition above, but
+                # plain pointwise evaluation with no coefficient merge and no
+                # safety margin (paper, Section 8, "grid-based calendar
+                # imposition" baseline used only for comparison in exp_3).
+                grid_rows = cc.body_body_calendar_grid_rows(v_n.basis, v_n1.basis, overlap.M_n.shape[0])
+                if grid_rows is not None:
+                    design_n, design_n1 = grid_rows
+                    s = _slack(design_n.shape[0])
+                    lhs = design_n1 @ v_n1.d - design_n @ v_n.d
+                    constraints.append((lhs + s if s is not None else lhs) >= 0)
+                    n_calendar += design_n.shape[0]
+            else:
+                raise ValueError(f"unknown body_body_calendar_mode={body_body_calendar_mode!r}")
 
         n_band_rows = 0
         used_grid_put = used_grid_call = False
@@ -138,7 +211,10 @@ def build_surface_qp(
             )
             if band is not None:
                 constraints.append(
-                    _one_sided_band_constraint(band.body_design, v_n1.d, band.wing_h, v_n.a_L, band.eps)
+                    _band_calendar_constraint(
+                        band.body_design, v_n1.d, band.wing_h, v_n.a_L, band.eps,
+                        margin_on="n", slack=_slack(band.x_grid.size),
+                    )
                 )
                 n_band_rows += band.x_grid.size
         elif v_n.fit.x_l < v_n1.fit.x_l - 1e-12:
@@ -150,7 +226,10 @@ def build_surface_qp(
             )
             if band is not None:
                 constraints.append(
-                    _one_sided_band_constraint(band.wing_h, v_n1.a_L, band.body_design, v_n.d, np.zeros(1))
+                    _band_calendar_constraint(
+                        band.wing_h, v_n1.a_L, band.body_design, v_n.d, band.eps,
+                        margin_on="n1", slack=_slack(band.x_grid.size),
+                    )
                 )
                 n_band_rows += band.x_grid.size
 
@@ -163,7 +242,10 @@ def build_surface_qp(
             )
             if band is not None:
                 constraints.append(
-                    _one_sided_band_constraint(band.body_design, v_n1.d, band.wing_h, v_n.a_R, band.eps)
+                    _band_calendar_constraint(
+                        band.body_design, v_n1.d, band.wing_h, v_n.a_R, band.eps,
+                        margin_on="n", slack=_slack(band.x_grid.size),
+                    )
                 )
                 n_band_rows += band.x_grid.size
         elif v_n.fit.x_h > v_n1.fit.x_h + 1e-12:
@@ -175,24 +257,34 @@ def build_surface_qp(
             )
             if band is not None:
                 constraints.append(
-                    _one_sided_band_constraint(band.wing_h, v_n1.a_R, band.body_design, v_n.d, np.zeros(1))
+                    _band_calendar_constraint(
+                        band.wing_h, v_n1.a_R, band.body_design, v_n.d, band.eps,
+                        margin_on="n1", slack=_slack(band.x_grid.size),
+                    )
                 )
                 n_band_rows += band.x_grid.size
 
         # Deep put-wing / put-wing and call-wing / call-wing regions beyond
         # both seams (paper, Appendix A).
         constraints.append(
-            _wing_wing_rows(mu_put, v_n.a_L, abs(v_n.k_s_put), v_n1.a_L, abs(v_n1.k_s_put), wing_margin_delta_mu)
+            _wing_wing_rows(
+                mu_put, v_n.a_L, abs(v_n.k_s_put), v_n1.a_L, abs(v_n1.k_s_put),
+                wing_margin_delta_mu, slack=_slack(len(mu_put)),
+            )
         )
         constraints.append(
-            _wing_wing_rows(mu_call, v_n.a_R, abs(v_n.k_s_call), v_n1.a_R, abs(v_n1.k_s_call), wing_margin_delta_mu)
+            _wing_wing_rows(
+                mu_call, v_n.a_R, abs(v_n.k_s_call), v_n1.a_R, abs(v_n1.k_s_call),
+                wing_margin_delta_mu, slack=_slack(len(mu_call)),
+            )
         )
-        n_calendar += n_band_rows + 2 * len(mu_put)
+        n_wing_wing = len(mu_put) + len(mu_call)
+        n_calendar += n_band_rows + n_wing_wing
 
         pair_diag.append(
             CalendarPairDiagnostics(
                 n_index=n, n1_index=n + 1, n_body_wing_rows=n_band_rows,
-                n_wing_wing_rows=2 * len(mu_put), used_grid_fallback_put=used_grid_put,
+                n_wing_wing_rows=n_wing_wing, used_grid_fallback_put=used_grid_put,
                 used_grid_fallback_call=used_grid_call,
             )
         )
@@ -202,6 +294,7 @@ def build_surface_qp(
         slice_vars=slice_vars, constraints=constraints, objective=objective,
         n_calendar_inequalities=n_calendar, pair_diagnostics=pair_diag,
         varswap_terms=varswap_terms if with_variance_swap else None,
+        calendar_slacks=calendar_slacks,
     )
 
 
@@ -218,7 +311,26 @@ class SurfaceFitResult:
 
 def solve_surface(qp: SurfaceQP, solver: str = cp.CLARABEL) -> SurfaceFitResult:
     problem = cp.Problem(cp.Minimize(qp.objective), qp.constraints)
-    problem.solve(solver=solver)
+    # The roughness-penalty block (src/bspline_body.smoothness_penalty_matrix) has a
+    # wide dynamic range because knot spacing varies by orders of magnitude between
+    # the near-the-money and wing regions of a slice; Clarabel's default Ruiz
+    # equilibration needs more iterations and a looser gap tolerance to certify
+    # optimality on this scale than on a well-scaled textbook QP.
+    try:
+        problem.solve(solver=solver, max_iter=2000, tol_gap_abs=1e-5, tol_gap_rel=1e-6,
+                      tol_feas=1e-6, time_limit=45.0)
+    except cp.error.SolverError:
+        pass
+    if problem.status not in ("optimal", "optimal_inaccurate"):
+        # Clarabel can stall at "InsufficientProgress" on this wide-dynamic-range
+        # roughness-penalty block (see src/bspline_body.smoothness_penalty_matrix)
+        # while the duality gap is already small, or fail outright on a large
+        # joint program; SCS's diagonal scaling handles the conditioning at the
+        # cost of more iterations.
+        try:
+            problem.solve(solver=cp.SCS, max_iters=10000, eps=1e-4)
+        except cp.error.SolverError:
+            pass
     if problem.status not in ("optimal", "optimal_inaccurate"):
         raise RuntimeError(f"Surface QP did not solve to optimality: status={problem.status}")
     d_values = [v.d.value for v in qp.slice_vars]

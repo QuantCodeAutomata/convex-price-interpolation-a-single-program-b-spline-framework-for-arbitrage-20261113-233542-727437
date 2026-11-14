@@ -137,8 +137,14 @@ def _atom_third_derivative_bound(dictionary: WingDictionary, k_lo: float, k_hi: 
     itself, so a numerical estimate is adequate."""
     k_grid = np.linspace(min(k_lo, k_hi), max(k_lo, k_hi), n_sample)
     eps = max(1e-6, (k_grid[1] - k_grid[0]) * 1e-3)
-    _, _, d2h_plus = dictionary.atom_derivatives(k_grid + eps, k_s)
-    _, _, d2h_minus = dictionary.atom_derivatives(k_grid - eps, k_s)
+    sign_ks = np.sign(k_s) if k_s != 0 else 1.0
+    # Clip the finite-difference offsets so every sampled point stays on the
+    # wing's domain |k| >= |k_s| even when the band's near edge sits exactly
+    # at the seam.
+    k_plus = sign_ks * np.maximum(sign_ks * (k_grid + eps), abs(k_s))
+    k_minus = sign_ks * np.maximum(sign_ks * (k_grid - eps), abs(k_s))
+    _, _, d2h_plus = dictionary.atom_derivatives(k_plus, k_s)
+    _, _, d2h_minus = dictionary.atom_derivatives(k_minus, k_s)
     d3h = (d2h_plus - d2h_minus) / (2 * eps)
     return np.max(np.abs(d3h), axis=1)
 
@@ -185,9 +191,20 @@ def body_wing_band(
     return BodyWingBand(x_grid=x_grid, body_design=body_design, wing_h=h_vals, eps=eps)
 
 
-def wing_summation_by_parts_beta(a: np.ndarray, mu: np.ndarray, kappa: float) -> np.ndarray:
-    """beta_i = a_i * kappa^(1/2) * exp(mu_i * kappa) (paper, Appendix A)."""
-    return a * np.sqrt(kappa) * np.exp(mu * kappa)
+def wing_summation_by_parts_beta(a, mu: np.ndarray, kappa: float):
+    """beta_i = a_i * kappa^(1/2) * exp(mu_i * kappa) (paper, Appendix A).
+
+    ``a`` may be a plain numpy array or a cvxpy vector expression. Plain
+    ``*`` between two length-N arrays dispatches to matrix (dot) product in
+    cvxpy, collapsing the vector to a scalar; ``cp.multiply`` is required
+    for the elementwise product needed here.
+    """
+    factor = np.sqrt(kappa) * np.exp(mu * kappa)
+    if isinstance(a, np.ndarray):
+        return a * factor
+    import cvxpy as cp
+
+    return cp.multiply(a, factor)
 
 
 def wing_calendar_cumulative_rows(mu: np.ndarray) -> np.ndarray:
