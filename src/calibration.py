@@ -6,9 +6,9 @@ atoms, under the linear no-arbitrage constraints of Section 4 and the C^2
 join equalities of Section 5.3, and solves the weighted least-squares fit
 with smoothness and ridge penalties (Section 7) as a quadratic program.
 
-cvxpy + Clarabel (Context7: cvxpy is the standard Python convex-optimisation
-modelling layer; Clarabel is registered as a cvxpy conic solver and is the
-solver the paper names) are used to assemble and solve the program; no
+cvxpy + Clarabel (cvxpy is the standard Python convex-optimisation modelling
+layer; Clarabel is registered as a cvxpy conic solver and is the solver the
+paper names) are used to assemble and solve the program; no
 library implements the paper's specific no-arbitrage QP, so the constraint
 and objective assembly below is a custom implementation of Sections 4, 5, 7.
 """

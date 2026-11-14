@@ -2,9 +2,10 @@
 
 Working in the paper's normalised coordinates x = K/F, c(x) = C(Fx)/F, the
 forward is 1 and the formulas below are the standard Black-76 formulas with
-F = 1 and strike x. scipy.stats.norm / scipy.optimize.brentq (Context7:
-scipy has no dedicated option-pricing routine, so the closed-form Black-76
-price is implemented directly from its standard formula).
+F = 1 and strike x. scipy has no dedicated option-pricing routine, so the
+closed-form Black-76 price (scipy.stats.norm for the CDF, scipy.optimize.brentq
+for implied-volatility inversion) is implemented directly from its standard
+formula.
 """
 from __future__ import annotations
 

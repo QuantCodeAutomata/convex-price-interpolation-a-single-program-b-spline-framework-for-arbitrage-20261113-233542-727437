@@ -10,8 +10,8 @@ two neighbouring slices' body domains [x_l, x_h] generally differ:
    insertion, Boehm's algorithm); non-negativity of all its refined
    coefficients is a sufficient condition for Delta c(x) >= 0 everywhere in
    the overlap (B-spline convex-hull property), which is the paper's
-   approach. Context7 (scipy docs): ``scipy.interpolate.insert`` implements
-   Boehm's knot-insertion algorithm directly; applying it to a vector-valued
+   approach. ``scipy.interpolate.insert`` implements Boehm's knot-insertion
+   algorithm directly; applying it to a vector-valued
    (identity-coefficient) BSpline turns the insertion into a plain linear
    map, reused here exactly as the D_1, D_2 derivative maps are reused in
    src/bspline_body.py.

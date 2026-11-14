@@ -2,9 +2,9 @@
 
 Uses scipy.interpolate.BSpline for basis evaluation and for the exact
 derivative-coefficient recursion (``BSpline.derivative``), rather than
-re-deriving de Boor's formulas from scratch: Context7 (scipy docs) confirms
-``BSpline.derivative(nu)`` returns the spline's exact derivative on a reduced
-knot vector, which is precisely the linear coefficient map D_1, D_2 the paper
+re-deriving de Boor's formulas from scratch: ``BSpline.derivative(nu)``
+returns the spline's exact derivative on a reduced knot vector, which is
+precisely the linear coefficient map D_1, D_2 the paper
 specifies (eq. in Section 4: e_j = p(d_{j+1}-d_j)/(t_{j+p+1}-t_{j+1}), applied
 again for f_j). Applying it to an identity coefficient matrix yields exactly
 these D_1, D_2 maps as ordinary matrices, which we then use both for the

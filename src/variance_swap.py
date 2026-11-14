@@ -7,9 +7,9 @@ The replication formula for the fair variance of log(S_T/F) is
 
 Both pieces are linear in the body coefficients d and the wing weights
 a_L, a_R, so L_n = A_n @ d_n + g_L_n @ a_L_n + g_R_n @ a_R_n + const_n for
-every maturity n. scipy.special.erfcx (Context7: scipy.special is the
-standard library for the scaled complementary error function; no portfolio/
-options library implements this paper-specific closed form) avoids the
+every maturity n. scipy.special.erfcx (scipy.special is the standard library
+for the scaled complementary error function; no portfolio/options library
+implements this paper-specific closed form) avoids the
 cancellation of a huge exp(.) against a tiny erfc(.) in the wing integral.
 
 Derivation of the wing closed form (checked against eq. derived from h_i,
