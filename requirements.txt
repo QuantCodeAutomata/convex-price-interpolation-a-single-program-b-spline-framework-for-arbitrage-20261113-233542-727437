@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+cvxpy
+clarabel
+matplotlib
+requests
+python-dotenv
+pytest

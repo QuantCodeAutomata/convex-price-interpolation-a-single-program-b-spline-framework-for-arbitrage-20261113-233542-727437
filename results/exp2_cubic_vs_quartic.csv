@@ -1,0 +1,9 @@
+metric,value
+rms_diff_bps,0.701078751459932
+max_diff_bps,3.7306959475272294
+density_agreement_pct,2.838559935155402
+expiry_date,2027-04-30
+settlement,PM
+time_to_expiry,0.45924127980720447
+forward,7681.602628484107
+n_quotes_used,201
